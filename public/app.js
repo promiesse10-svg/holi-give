@@ -1,10 +1,4 @@
-// app.js — HOLI give page
-// - i18n + local save
-// - ambient / parallax / dev dial
-// - App preview modal
-// - Square Web Payments SDK (Card, Apple Pay, Google Pay, Cash App Pay, ACH optional)
-// - Deterministic wallet mounts + debug logging
-
+// app.js — HOLI give page (Square wallets fixed: proper teardown + deterministic mounts)
 (function(){
   const root = document.documentElement;
   const body = document.body;
@@ -136,7 +130,6 @@
     setupDevPanel();
     setupManageLinks();
     setupAppTeaser();
-    // theme-color to light
     try{ document.querySelector('meta[name="theme-color"]').setAttribute('content', '#ffffff'); }catch{}
   });
 
@@ -198,7 +191,99 @@
     applyI18n();
   }
 
-  // ---------- Giving logic (no frequency, no cover fees, no receipt preview) ----------
+  // ---------- Payments: shared state & helpers ----------
+  const SQ = {}; // will hold instances per open
+  function cryptoRandom(){
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
+      const r = Math.random()*16|0, v = c === 'x' ? r : (r&0x3|0x8); return v.toString(16);
+    });
+  }
+  function getSquareCreds(){
+    const appId = document.querySelector('meta[name="square:app-id"]')?.content?.trim();
+    const locationId = document.querySelector('meta[name="square:location-id"]')?.content?.trim();
+    return { appId, locationId };
+  }
+  async function ensurePayments(){
+    if (!window.Square){ showPayError('Square SDK not loaded. Add <script src="https://web.squarecdn.com/v1/square.js"></script>'); return null; }
+    if (window.__holi_sq_payments) return window.__holi_sq_payments;
+    const { appId, locationId } = getSquareCreds();
+    if (!appId || !locationId){ showPayError('Missing Square App ID or Location ID in meta tags.'); return null; }
+    try{
+      window.__holi_sq_payments = await window.Square.payments(appId, locationId);
+      return window.__holi_sq_payments;
+    }catch(err){
+      showPayError(err?.message || 'Square payments init failed. Check Allowed Domains and IDs.');
+      return null;
+    }
+  }
+  function paymentRequestFor(amount){
+    const amtStr = (amount ?? 0).toFixed(2);
+    return {
+      countryCode: 'US',
+      currencyCode: 'USD',
+      total: { amount: amtStr, label: 'HOLI Gift' },
+      requestBillingContact: true
+    };
+  }
+  async function completePayment(sourceId, amount, fundValue, fundLabel, buyerName, buyerEmail){
+    try{
+      const resp = await fetch('/api/pay', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({
+          sourceId,
+          amount: Math.round((amount||0) * 100),
+          currency: 'USD',
+          fund: fundValue,
+          fundLabel,
+          buyerName,
+          buyerEmail
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data?.ok) throw new Error(data?.error || 'Payment failed');
+      dlog('payment success:', data?.payment?.id);
+      return true;
+    }catch(err){
+      showPayError(err?.message || 'Payment error');
+      throw err;
+    }
+  }
+  function showPayError(msg){
+    const el = document.getElementById('payError');
+    if (!el) { alert(msg); return; }
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+
+  // ---------- Teardown to avoid disappearing wallets on re-open ----------
+  async function teardownSquare(){
+    const keys = ['card','applePay','googlePay','cashAppPay','ach','giftCard','afterpay'];
+    for (const k of keys){
+      const inst = SQ[k];
+      if (!inst) continue;
+      try{
+        if (typeof inst.destroy === 'function') { await inst.destroy(); dlog(k, 'destroyed'); }
+      }catch(e){ dlog(k, 'destroy error', e); }
+      SQ[k] = null;
+    }
+    // Clear DOM mounts
+    const ids = ['card-container','google-pay-button','cash-app-pay-button','afterpay-button','gift-card-container'];
+    ids.forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
+    // Hide wallet shells
+    const appleBtn = document.getElementById('applePayBtn');
+    const gpayEl  = document.getElementById('google-pay-button');
+    const cashEl  = document.getElementById('cash-app-pay-button');
+    const aftEl   = document.getElementById('afterpay-button');
+    const achBtn  = document.getElementById('achBtn');
+    appleBtn && appleBtn.classList.add('hidden');
+    gpayEl && gpayEl.classList.add('hidden');
+    cashEl && cashEl.classList.add('hidden');
+    aftEl && aftEl.classList.add('hidden');
+    achBtn && achBtn.classList.add('hidden');
+  }
+
+  // ---------- Giving logic (no frequency/fees/receipt) ----------
   function setupGiving(){
     const form = document.getElementById('donationForm');
     if (!form) return;
@@ -220,18 +305,12 @@
     const sFund = document.getElementById('sFund');
     const sBase = document.getElementById('sBase');
     const sTotal = document.getElementById('sTotal');
-    const sFreq = document.getElementById('sFreq'); // may not exist in your trimmed HTML; guard
-    const sNextRow = document.getElementById('sNextRow'); // guard
     const confirmPay = document.getElementById('confirmPay');
     const confirmSpin = document.getElementById('confirmSpin');
     const confirmText = document.getElementById('confirmText');
 
-    // Prefill from localStorage
-    const saved = {
-      fund: LS.get('holi.fund'),
-      name: LS.get('holi.name'),
-      email: LS.get('holi.email')
-    };
+    // Prefill
+    const saved = { fund: LS.get('holi.fund'), name: LS.get('holi.name'), email: LS.get('holi.email') };
     if (saved.fund) fundSel.value = saved.fund;
     if (saved.name) nameInput.value = saved.name;
     if (saved.email) emailInput.value = saved.email;
@@ -249,59 +328,29 @@
       const n = parseAmt();
       amountInput.value = n ? n.toFixed(2) : '';
     }
-
     function setFieldInvalid(inputEl, errorEl, on){
       if (!inputEl || !errorEl) return;
       inputEl.setAttribute('aria-invalid', on ? 'true' : 'false');
       errorEl.classList.toggle('hidden', !on);
     }
-
     function updateSummary(){
       const amt = parseAmt();
       const invalidAmt = !(amt >= MIN && amt <= MAX);
       setFieldInvalid(amountInput, amountError, invalidAmt);
-
       const nameMissing = !(nameInput.value || '').trim();
       const emailMissing = !emailOK(emailInput.value);
-
       setFieldInvalid(nameInput, nameError, nameMissing);
       setFieldInvalid(emailInput, emailError, emailMissing);
-
       const invalid = invalidAmt || nameMissing || emailMissing;
-
       giveBtn.disabled = invalid;
-
       const fundText = fundSel.options[fundSel.selectedIndex].textContent.trim();
       summary.textContent = (!invalid && amt) ? `${fmtUSD(amt)} → ${fundText}. ${i18n[STATE.lang].sheet.total}: ${fmtUSD(amt)}.` : '';
-
       STATE._updateSummary = updateSummary;
       return !invalid;
     }
 
-    // Persist prefs on change
-    fundSel.addEventListener('change', ()=>{ LS.set('holi.fund', fundSel.value); updateSummary(); });
-    nameInput.addEventListener('blur', ()=>{ const v=nameInput.value.trim(); if(v){ LS.set('holi.name', v); } updateSummary(); });
-    emailInput.addEventListener('blur', ()=>{ const v=emailInput.value.trim(); if(emailOK(v)){ LS.set('holi.email', v); } updateSummary(); });
-
-    // Interactions
-    chips.forEach(ch => ch.addEventListener('click', () => {
-      chips.forEach(x => x.classList.remove('on'));
-      ch.classList.add('on');
-      amountInput.value = parseFloat(ch.dataset.amount).toFixed(2);
-      updateSummary();
-      amountInput.focus();
-    }));
-    amountInput.addEventListener('input', () => { chips.forEach(x => x.classList.remove('on')); updateSummary(); });
-    amountInput.addEventListener('blur', () => { formatInput(); updateSummary();
-      const v = parseAmt(); const match = chips.find(c => parseFloat(c.dataset.amount) === v); if (match) match.classList.add('on');
-    });
-    amountInput.addEventListener('keydown', (e)=>{ if (e.key === 'Enter'){ e.preventDefault(); if (updateSummary()) openSheet(); } });
-
-    // ----- Payment Sheet open/close -----
     function ensurePaymentDOM(){
       const body = sheet.querySelector('.sheet-body');
-
-      // Error line
       let payErr = document.getElementById('payError');
       if (!payErr){
         payErr = document.createElement('div');
@@ -309,106 +358,58 @@
         payErr.className = 'error hidden';
         body.prepend(payErr);
       }
-
-      // Ensure card container
       let card = document.getElementById('card-container');
-      if (!card){
-        card = document.createElement('div');
-        card.id = 'card-container';
-        body.appendChild(card);
-      }
-
-      // Wallet row (use existing .pay-methods, but ensure SDK containers)
-      const pm = sheet.querySelector('.pay-methods') || (() => {
-        const w = document.createElement('div'); w.className = 'pay-methods'; body.prepend(w); return w;
-      })();
-
-      // Apple button (existing or create)
+      if (!card){ card = document.createElement('div'); card.id = 'card-container'; body.appendChild(card); }
+      const pm = sheet.querySelector('.pay-methods') || (()=>{ const w=document.createElement('div'); w.className='pay-methods'; body.prepend(w); return w;})();
       let appleBtn = document.getElementById('applePayBtn');
-      if (!appleBtn){
-        appleBtn = document.createElement('button');
-        appleBtn.id = 'applePayBtn';
-        appleBtn.className = 'paybtn apple hidden';
-        appleBtn.type = 'button';
-        appleBtn.textContent = 'Buy with  Pay';
-        pm.appendChild(appleBtn);
-      }
-
-      // Google Pay container
+      if (!appleBtn){ appleBtn = document.createElement('button'); appleBtn.id='applePayBtn'; appleBtn.className='paybtn apple hidden'; appleBtn.type='button'; appleBtn.textContent='Buy with  Pay'; pm.appendChild(appleBtn); }
       let gpayDiv = document.getElementById('google-pay-button');
-      if (!gpayDiv){
-        gpayDiv = document.createElement('div');
-        gpayDiv.id = 'google-pay-button';
-        gpayDiv.className = 'hidden';
-        pm.appendChild(gpayDiv);
-      }
-
-      // Cash App Pay container
+      if (!gpayDiv){ gpayDiv = document.createElement('div'); gpayDiv.id='google-pay-button'; gpayDiv.className='hidden'; pm.appendChild(gpayDiv); }
       let cashDiv = document.getElementById('cash-app-pay-button');
-      if (!cashDiv){
-        cashDiv = document.createElement('div');
-        cashDiv.id = 'cash-app-pay-button';
-        cashDiv.className = 'hidden';
-        pm.appendChild(cashDiv);
-      }
-
-      // Afterpay container (optional)
+      if (!cashDiv){ cashDiv = document.createElement('div'); cashDiv.id='cash-app-pay-button'; cashDiv.className='hidden'; pm.appendChild(cashDiv); }
       let afterDiv = document.getElementById('afterpay-button');
-      if (!afterDiv){
-        afterDiv = document.createElement('div');
-        afterDiv.id = 'afterpay-button';
-        afterDiv.className = 'hidden';
-        pm.appendChild(afterDiv);
-      }
-
-      // ACH button (optional)
+      if (!afterDiv){ afterDiv = document.createElement('div'); afterDiv.id='afterpay-button'; afterDiv.className='hidden'; pm.appendChild(afterDiv); }
       let achBtn = document.getElementById('achBtn');
-      if (!achBtn){
-        achBtn = document.createElement('button');
-        achBtn.id = 'achBtn';
-        achBtn.className = 'paybtn bank hidden';
-        achBtn.type = 'button';
-        achBtn.textContent = 'Pay from bank (ACH)';
-        pm.appendChild(achBtn);
-      }
+      if (!achBtn){ achBtn = document.createElement('button'); achBtn.id='achBtn'; achBtn.className='paybtn bank hidden'; achBtn.type='button'; achBtn.textContent='Pay from bank (ACH)'; pm.appendChild(achBtn); }
     }
 
-    function openSheet(){
+    async function openSheet(){
       if (!updateSummary()) return;
       const amt = parseAmt();
-
-      // Fill summary (no freq/fees)
       const fundText = fundSel.options[fundSel.selectedIndex].textContent.trim();
       sFund && (sFund.textContent = fundText);
       sBase && (sBase.textContent = fmtUSD(amt));
       sTotal && (sTotal.textContent = fmtUSD(amt));
-      sFreq && (sFreq.textContent = i18n[STATE.lang].once || 'One-time');
-      sNextRow && sNextRow.classList.add('hidden');
 
       sheet.classList.remove('hidden');
       ensurePaymentDOM();
 
-      // Hide error, disable confirm until mounts complete
       const payError = document.getElementById('payError');
       payError && payError.classList.add('hidden');
       confirmPay.disabled = true;
 
-      // Initialize Square mounts deterministically
+      // Tear down any old instances BEFORE mounting fresh ones
+      await teardownSquare();
+
+      // Allow one frame so the sheet is visible (prevents hidden-mount glitches)
+      await new Promise(requestAnimationFrame);
+
       setupSquareForAmount(amt).then((ok)=>{
         if (ok) { confirmPay.disabled = false; confirmPay.focus(); }
       }).catch((err)=>{
         showPayError(err?.message || 'Failed to initialize payment form.');
       });
     }
-    function closeSheet(){ sheet.classList.add('hidden'); }
+    async function closeSheet(){
+      sheet.classList.add('hidden');
+      await teardownSquare(); // ensure clean state for next open
+    }
 
     document.getElementById('openReceipt')?.addEventListener('click', (e)=> e.preventDefault());
     document.getElementById('previewBtn')?.addEventListener('click', (e)=> e.preventDefault());
-
     sheet.addEventListener('click', (e) => { if (e.target.matches('[data-close]')) closeSheet(); });
     document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ closeSheet(); } });
 
-    // Confirm (Card)
     confirmPay.addEventListener('click', async () => {
       confirmPay.disabled = true; confirmSpin.classList.remove('hidden');
       confirmText.textContent = i18n[STATE.lang].confirmGive + '…';
@@ -418,7 +419,6 @@
         if (res.status !== 'OK') throw new Error(res?.errors?.[0]?.message || 'Could not tokenize card');
         await completePayment(res.token, parseAmt(), fundSel.value, fundSel.options[fundSel.selectedIndex]?.textContent.trim(), nameInput.value.trim(), emailInput.value.trim());
         showToast('Gift received. Thank you!');
-        // optional: confetti
         try{ confettiBurst(); }catch{}
         closeSheet();
       }catch(err){
@@ -430,46 +430,10 @@
 
     // Init
     updateSummary();
-
-    // Public open for "Give Now" button
     giveBtn.addEventListener('click', openSheet);
   }
 
-  // ---------- Square Web Payments ----------
-  const SQ = {}; // holds instances
-
-  function getSquareCreds(){
-    const appId = document.querySelector('meta[name="square:app-id"]')?.content?.trim();
-    const locationId = document.querySelector('meta[name="square:location-id"]')?.content?.trim();
-    return { appId, locationId };
-  }
-
-  async function ensurePayments(){
-    if (!window.Square){ showPayError('Square SDK not loaded. Add <script src="https://web.squarecdn.com/v1/square.js"></script>'); return null; }
-    if (window.__holi_sq_payments) return window.__holi_sq_payments;
-
-    const { appId, locationId } = getSquareCreds();
-    if (!appId || !locationId){ showPayError('Missing Square App ID or Location ID in meta tags.'); return null; }
-
-    try{
-      window.__holi_sq_payments = await window.Square.payments(appId, locationId);
-      return window.__holi_sq_payments;
-    }catch(err){
-      showPayError(err?.message || 'Square payments init failed. Check Allowed Domains and IDs.');
-      return null;
-    }
-  }
-
-  function paymentRequestFor(amount){
-    const amtStr = (amount ?? 0).toFixed(2);
-    return {
-      countryCode: 'US',
-      currencyCode: 'USD',
-      total: { amount: amtStr, label: 'HOLI Gift' },
-      requestBillingContact: true
-    };
-  }
-
+  // ---------- Square mount logic (idempotent, deterministic) ----------
   async function setupSquareForAmount(amount){
     const payments = await ensurePayments();
     if (!payments) { showPayError("Square not initialized (check App ID, Location ID, HTTPS, Allowed Domains)."); return false; }
@@ -482,13 +446,13 @@
     const afterpayEl = document.getElementById('afterpay-button');
     const achBtn = document.getElementById('achBtn');
 
-    // Clean containers
-    if (cardContainer) cardContainer.innerHTML = '';
-    if (gpayEl) gpayEl.innerHTML = '';
-    if (cashAppEl) cashAppEl.innerHTML = '';
-    if (afterpayEl) afterpayEl.innerHTML = '';
+    // Ensure clean state
+    cardContainer && (cardContainer.innerHTML = '');
+    gpayEl && (gpayEl.innerHTML = '');
+    cashAppEl && (cashAppEl.innerHTML = '');
+    afterpayEl && (afterpayEl.innerHTML = '');
 
-    // Let the sheet paint one frame to avoid hidden-mount glitches
+    // Wait one frame so sheet is fully visible
     await new Promise(requestAnimationFrame);
 
     // CARD (should always render)
@@ -501,26 +465,30 @@
       showPayError('Could not load card input. Check Console for details.');
     }
 
-    // Helper PR
     const pr = ()=> paymentRequestFor(amount);
 
     // APPLE PAY
     try {
-      const ap = await payments.applePay(pr());
-      const can = await ap.canMakePayment();
-      dlog('applePay.canMakePayment:', can);
-      if (can && appleBtn) {
-        SQ.applePay = ap;
-        appleBtn.classList.remove('hidden');
-        appleBtn.onclick = async (e)=>{
-          e.preventDefault();
-          try{
-            const res = await SQ.applePay.tokenize();
-            if (res?.status === 'OK') await completePayment(res.token, amount);
-            else showPayError(res?.errors?.[0]?.message || 'Apple Pay error');
-          }catch(err){ showPayError(err?.message || 'Apple Pay error'); }
-        };
-      } else { appleBtn && appleBtn.classList.add('hidden'); }
+      if (!('ApplePaySession' in window)) {
+        dlog('applePay: not supported on this browser');
+        appleBtn && appleBtn.classList.add('hidden');
+      } else {
+        const ap = await payments.applePay(pr());
+        const can = await ap.canMakePayment();
+        dlog('applePay.canMakePayment:', can);
+        if (can && appleBtn) {
+          SQ.applePay = ap;
+          appleBtn.classList.remove('hidden');
+          appleBtn.onclick = async (e)=>{
+            e.preventDefault();
+            try{
+              const res = await SQ.applePay.tokenize();
+              if (res?.status === 'OK') await completePayment(res.token, amount);
+              else showPayError(res?.errors?.[0]?.message || 'Apple Pay error');
+            }catch(err){ showPayError(err?.message || 'Apple Pay error'); }
+          };
+        } else { appleBtn && appleBtn.classList.add('hidden'); }
+      }
     } catch (e) {
       dlog('applePay init error:', e);
       appleBtn && appleBtn.classList.add('hidden');
@@ -541,7 +509,7 @@
       gpayEl && gpayEl.classList.add('hidden');
     }
 
-    // CASH APP PAY (must be enabled on your Square account)
+    // CASH APP PAY
     try {
       const cap = await payments.cashAppPay(pr(), { redirectURL: location.origin + location.pathname });
       await cap.attach('#cash-app-pay-button');
@@ -574,13 +542,12 @@
       });
       dlog('afterpay: attached');
     } catch (e) {
-      dlog('afterpay init error (not available/amount):', e);
+      dlog('afterpay init error:', e);
       afterpayEl && afterpayEl.classList.add('hidden');
     }
 
     // ACH (optional)
     try {
-      const payments = await ensurePayments();
       SQ.ach = await payments.ach({ redirectURI: location.origin + location.pathname, transactionId: cryptoRandom() });
       achBtn && achBtn.classList.remove('hidden');
       achBtn && (achBtn.onclick = async (e)=>{
@@ -607,51 +574,11 @@
     return true;
   }
 
-  function cryptoRandom(){
-    // tiny uuid-ish for ACH transaction stub
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
-      const r = Math.random()*16|0, v = c === 'x' ? r : (r&0x3|0x8); return v.toString(16);
-    });
-  }
-
-  async function completePayment(sourceId, amount, fundValue, fundLabel, buyerName, buyerEmail){
-    try{
-      const resp = await fetch('/api/pay', {
-        method:'POST',
-        headers:{ 'Content-Type':'application/json' },
-        body: JSON.stringify({
-          sourceId,
-          amount: Math.round((amount||0) * 100),
-          currency: 'USD',
-          fund: fundValue,
-          fundLabel,
-          buyerName,
-          buyerEmail
-        })
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data?.ok) throw new Error(data?.error || 'Payment failed');
-      dlog('payment success:', data?.payment?.id);
-      return true;
-    }catch(err){
-      showPayError(err?.message || 'Payment error');
-      throw err;
-    }
-  }
-
-  function showPayError(msg){
-    const el = document.getElementById('payError');
-    if (!el) { alert(msg); return; }
-    el.textContent = msg;
-    el.classList.remove('hidden');
-  }
-
   // ---------- Footer micro-parallax ----------
   function setupParallaxFooter(){
     const links = Array.from(document.querySelectorAll('.drift-link'));
     function onScroll(){
-      const max = 4; // px
-      const p = Math.min(1, (window.scrollY || 0) / 600);
+      const max = 4; const p = Math.min(1, (window.scrollY || 0) / 600);
       const y = -p * max;
       links.forEach((a)=> a.style.transform = `translateY(${y}px)`);
     }
@@ -659,7 +586,7 @@
     window.addEventListener('scroll', onScroll, {passive:true});
   }
 
-  // ---------- Dev Neon Dial (?dev=1 shows panel) ----------
+  // ---------- Dev Neon Dial ----------
   function setupDevPanel(){
     const params = new URLSearchParams(location.search);
     const dev = params.get('dev') === '1';
@@ -688,14 +615,10 @@
     const openers = ['appPill','appLink','appFooterLink']
       .map(id => document.getElementById(id))
       .filter(Boolean);
-
     function open(){ modal && modal.classList.remove('hidden'); }
-    function close(){ modal && modal.classList.add('hidden'); }
-
+    async function close(){ modal && modal.classList.add('hidden'); }
     openers.forEach(el => el.addEventListener('click', open));
-    if (modal){
-      modal.addEventListener('click', (e)=>{ if (e.target.matches('[data-close]')) close(); });
-    }
+    if (modal){ modal.addEventListener('click', (e)=>{ if (e.target.matches('[data-close]')) close(); }); }
     document.addEventListener('keydown', (e)=>{ if (e.key === 'Escape') close(); });
   }
 
@@ -708,13 +631,10 @@
     setTimeout(()=> { toast.classList.remove('show'); setTimeout(()=> toast.classList.add('hidden'), 250); }, 2200);
   }
 
-  // ---------- Confetti (subtle) ----------
+  // ---------- Confetti ----------
   function confettiBurst(){
     const c = document.createElement('canvas');
-    c.style.position = 'fixed';
-    c.style.inset = '0';
-    c.style.pointerEvents = 'none';
-    c.style.zIndex = '80';
+    c.style.position = 'fixed'; c.style.inset = '0'; c.style.pointerEvents = 'none'; c.style.zIndex = '80';
     document.body.appendChild(c);
     const ctx = c.getContext('2d');
     let W,H; const P=[]; const N=120; const G=0.15;
